@@ -2,6 +2,7 @@ import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, To
 import { Runnable } from '@langchain/core/runnables';
 import { ChatOpenAI } from '@langchain/openai';
 import { Inject, Injectable } from '@nestjs/common';
+import { MemoryService } from './memory.service';
 
 @Injectable()
 export class AiService {
@@ -10,24 +11,39 @@ export class AiService {
 
   constructor(@Inject('CHAT_MODEL') model: ChatOpenAI,
     @Inject('SEND_EMAIL_TOOL') private readonly sendMailTool: any,
-    @Inject('WEB_SEARCH_TOOL') private readonly webSearchTool: any) {
-    this.tools = [this.sendMailTool, this.webSearchTool];
+    @Inject('WEB_SEARCH_TOOL') private readonly webSearchTool: any,
+    @Inject('RAG_SEARCH_TOOL') private readonly ragSearchTool: any,
+    private readonly memoryService: MemoryService) {
+    this.tools = [this.sendMailTool, this.webSearchTool, this.ragSearchTool];
     this.modelWithTools = model.bindTools(this.tools);
   }
 
-  async runChain(query: string): Promise<string> {
+  async runChain(query: string, sessionId = 'default'): Promise<string> {
     const messages: BaseMessage[] = [
       new SystemMessage(
-        '你是一个智能助手，可以在需要时调用工具（如 query_user）来查询用户信息，再用结果回答用户的问题。',
+        '你是一个智能助手，可以在需要时调用工具，再用结果回答用户的问题。',
       ),
-      new HumanMessage(query),
     ];
+
+    const memoryPrompt = this.memoryService.getMemoryPrompt(sessionId);
+    if (memoryPrompt) {
+      messages.push(memoryPrompt);
+    }
+
+    const session = this.memoryService.getSession(sessionId);
+    messages.push(...session.messages);
+
+    const humanMsg = new HumanMessage(query);
+    messages.push(humanMsg);
+    this.memoryService.pushMessages(sessionId, humanMsg);
 
     while (true) {
       const aiMessage = await this.modelWithTools.invoke(messages);
       messages.push(aiMessage);
       const toolCalls = aiMessage.tool_calls ?? [];
       if (!toolCalls.length) {
+        this.memoryService.pushMessages(sessionId, aiMessage);
+        await this.memoryService.trimIfNeeded(sessionId);
         return aiMessage.content as string;
       }
 
@@ -39,7 +55,7 @@ export class AiService {
           }
           try {
             return await tool.invoke(toolCall.args);
-          } catch (e:any) {
+          } catch (e: any) {
             return `error: ${e.message}`;
           }
         }),
@@ -57,13 +73,24 @@ export class AiService {
     }
   }
 
-  async *streamChain(query: string): AsyncGenerator<string> {
+  async *streamChain(query: string, sessionId = 'default'): AsyncGenerator<string> {
     const messages: BaseMessage[] = [
       new SystemMessage(
-        '你是一个智能助手，可以在需要时调用工具（如 query_user）来查询用户信息，再用结果回答用户的问题。',
+        '你是一个智能助手，可以在需要时调用工具，再用结果回答用户的问题。',
       ),
-      new HumanMessage(query),
     ];
+
+    const memoryPrompt = this.memoryService.getMemoryPrompt(sessionId);
+    if (memoryPrompt) {
+      messages.push(memoryPrompt);
+    }
+
+    const session = this.memoryService.getSession(sessionId);
+    messages.push(...session.messages);
+
+    const humanMsg = new HumanMessage(query);
+    messages.push(humanMsg);
+    this.memoryService.pushMessages(sessionId, humanMsg);
 
     while (true) {
       const stream = await this.modelWithTools.stream(messages);
@@ -83,6 +110,8 @@ export class AiService {
       const toolCalls = fullAiMessage.tool_calls ?? [];
 
       if (!toolCalls.length) {
+        this.memoryService.pushMessages(sessionId, fullAiMessage);
+        await this.memoryService.trimIfNeeded(sessionId);
         return;
       }
 
@@ -94,7 +123,7 @@ export class AiService {
           }
           try {
             return await tool.invoke(toolCall.args);
-          } catch (e:any) {
+          } catch (e: any) {
             return `error: ${e.message}`;
           }
         }),

@@ -2,16 +2,19 @@ import { Module } from '@nestjs/common';
 import { AiService } from './ai.service';
 import { AiController } from './ai.controller';
 import { ConfigService } from '@nestjs/config';
-import { ChatOpenAI } from '@langchain/openai';
+import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
+import { MilvusClient, MetricType } from '@zilliz/milvus2-sdk-node';
 import z from 'zod';
 import { tool } from '@langchain/core/tools';
 import { MailerService } from '@nestjs-modules/mailer';
+import { MemoryService } from './memory.service';
 
 
 @Module({
   controllers: [AiController],
   providers: [
     AiService,
+    MemoryService,
     {
       provide: 'CHAT_MODEL',
       useFactory: (configService: ConfigService) => {
@@ -132,6 +135,65 @@ URL: ${page.url}
               '使用 Bocha Web Search 搜索。输入搜索关键词，返回搜索结果。',
             schema: webSearchArgsSchema,
           })
+      },
+      inject: [ConfigService],
+    },
+    {
+      provide: 'RAG_SEARCH_TOOL',
+      useFactory: (configService: ConfigService) => {
+        const COLLECTION_NAME = 'md_collection';
+
+        const embeddings = new OpenAIEmbeddings({
+          apiKey: configService.get('OPENAI_API_KEY'),
+          model: configService.get('EMBEDDINGS_MODEL_NAME'),
+          configuration: {
+            baseURL: configService.get('OPENAI_BASE_URL'),
+          },
+        });
+
+        const milvusClient = new MilvusClient({
+          address: configService.get('MILVUS_ADDRESS') || '106.14.136.223:19530',
+        });
+
+        const ragSearchArgsSchema = z.object({
+          query: z.string().describe('搜索关键词，用于在知识库中检索相关文档片段'),
+          topK: z.number().int().min(1).max(10).optional().describe('返回的文档片段数量，默认3'),
+        });
+
+        return tool(async ({ query, topK = 3 }: { query: string; topK?: number }) => {
+          try {
+            await milvusClient.loadCollection({ collection_name: COLLECTION_NAME });
+          } catch (e: any) {
+            if (!e.message?.includes('already loaded')) {
+              return `加载集合失败: ${e.message}`;
+            }
+          }
+
+          const queryVector = await embeddings.embedQuery(query);
+          const searchResult = await milvusClient.search({
+            collection_name: COLLECTION_NAME,
+            vector: queryVector,
+            limit: topK,
+            metric_type: MetricType.COSINE,
+            output_fields: ['id', 'doc_id', 'doc_name', 'chunk_index', 'content'],
+          });
+
+          const results = searchResult.results;
+          if (!results.length) {
+            return '未找到相关内容。';
+          }
+
+          return results
+            .map((item: any, i: number) =>
+              `[片段 ${i + 1}] 相似度: ${item.score.toFixed(4)}\n文档: ${item.doc_name}\n内容: ${item.content}`)
+            .join('\n\n━━━━━\n\n');
+        },
+          {
+            name: 'rag_search',
+            description:
+              '在三维估值相关的知识库中检索文档片段。当用户询问三维估值相关的问题时（如开发排期、技术方案、功能设计等），使用此工具检索相关内容后再回答。',
+            schema: ragSearchArgsSchema,
+          });
       },
       inject: [ConfigService],
     },
